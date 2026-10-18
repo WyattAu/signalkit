@@ -105,6 +105,69 @@ pub fn org_bursts(
     Ok(out)
 }
 
+/// A GitHub subject whose fork ratio cleared the elevated threshold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForkFlag {
+    /// `owner/repo`.
+    pub key: String,
+    /// Latest star count.
+    pub stars: i64,
+    /// Latest fork count.
+    pub forks: i64,
+    /// Forks per 100 stars.
+    pub ratio_pct: f64,
+    /// The verdict at the store's standard thresholds.
+    pub verdict: ForkVerdict,
+}
+
+/// GitHub subjects inside the window whose latest fork ratio is at
+/// least Elevated (>= 20%), with at least `min_stars`.
+///
+/// # Errors
+/// Propagates store failures.
+pub fn fork_flags(store: &Store, window_days: u32, min_stars: i64) -> Result<Vec<ForkFlag>> {
+    let window_secs = i64::from(window_days) * 86_400;
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "
+            WITH latest AS (SELECT subject_id, MAX(ts) AS ts FROM observations GROUP BY subject_id)
+            SELECT s.key, o.score, o.extra1
+            FROM observations o
+            JOIN latest l ON l.subject_id = o.subject_id AND l.ts = o.ts
+            JOIN subjects s ON s.subject_id = o.subject_id
+            WHERE s.kind = 'github_repo'
+              AND o.ts >= (SELECT MAX(ts) FROM observations) - ?1
+              AND o.score >= ?2
+            ORDER BY o.extra1 * 1.0 / MAX(o.score, 1) DESC
+            ",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![window_secs, min_stars], |row| {
+                let key: String = row.get(0)?;
+                let stars: i64 = row.get(1)?;
+                let forks: i64 = row.get(2)?;
+                Ok((key, stars, forks))
+            })
+            .map_err(rusqlite::Error::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, stars, forks) = row.map_err(rusqlite::Error::from)?;
+            let ratio_pct = forks as f64 * 100.0 / stars.max(1) as f64;
+            let verdict = fork_verdict(stars, forks, min_stars);
+            if verdict != ForkVerdict::Normal {
+                out.push(ForkFlag {
+                    key,
+                    stars,
+                    forks,
+                    ratio_pct,
+                    verdict,
+                });
+            }
+        }
+        Ok(out)
+    })
+}
+
 /// A velocity outlier with its robust z-score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outlier {
@@ -144,7 +207,11 @@ pub fn velocity_outliers(store: &Store, window_days: u32, limit: u32) -> Result<
         let median = sorted[sorted.len() / 2];
         let mut devs: Vec<f64> = velocities.iter().map(|v| (v - median).abs()).collect();
         devs.sort_by(f64::total_cmp);
-        let mad = devs[devs.len() / 2].max(1e-9) * 1.4826;
+        let mad_raw = devs[devs.len() / 2] * 1.4826;
+        // Floor the MAD: when velocities are almost identical (two
+        // snapshot HN stories), MAD ~ 0 would flag everything with
+        // astronomical z-scores. 5% of median, at least 1/day.
+        let mad = mad_raw.max(median.abs() * 0.05).max(1.0);
         stats.insert(*kind, (median, mad));
     }
 
@@ -167,6 +234,22 @@ pub fn velocity_outliers(store: &Store, window_days: u32, limit: u32) -> Result<
         b.robust_z
             .partial_cmp(&a.robust_z)
             .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Mass-flag guard: when more than 10% of a kind is "outlying", the
+    // distribution is the problem, not the subjects — keep only the
+    // strongest per kind up to that budget.
+    let mut total_by_kind: std::collections::BTreeMap<SourceKind, usize> =
+        std::collections::BTreeMap::new();
+    for r in &rows {
+        *total_by_kind.entry(r.kind).or_default() += 1;
+    }
+    let mut kept: std::collections::BTreeMap<SourceKind, usize> = std::collections::BTreeMap::new();
+    out.retain(|o| {
+        let total = total_by_kind.get(&o.kind).copied().unwrap_or(0);
+        let count = kept.entry(o.kind).or_default();
+        *count += 1;
+        *count * 10 <= total
     });
     Ok(out)
 }
@@ -254,5 +337,17 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed(&store, "lonely/a", 1_000, 10, 900.0);
         assert!(velocity_outliers(&store, 14, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fork_flags_flag_only_the_suspicious() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store, "farm/a", 5_000, 2_500, 100.0); // 50% -> Extreme
+        seed(&store, "clean/b", 8_000, 300, 80.0); // 3.75% -> Normal
+        let flags = fork_flags(&store, 14, 200).unwrap();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].key, "farm/a");
+        assert_eq!(flags[0].verdict, ForkVerdict::Extreme);
+        assert!((flags[0].ratio_pct - 50.0).abs() < 1e-9);
     }
 }
