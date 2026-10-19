@@ -1,5 +1,7 @@
 # signalkit
 
+[![crates.io](https://img.shields.io/crates/v/signalkit.svg)](https://crates.io/crates/signalkit) [![crates.io](https://img.shields.io/crates/v/signalkit-core.svg)](https://crates.io/crates/signalkit-core) [![crates.io](https://img.shields.io/crates/v/signalkit-integrity.svg)](https://crates.io/crates/signalkit-integrity)
+
 Snapshot, store, and score **any counter** — the engine behind
 [trendkit](https://github.com/WyattAu/trendkit), extracted as reusable
 layers.
