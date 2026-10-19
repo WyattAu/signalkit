@@ -199,6 +199,100 @@ pub fn trust_band(score: f64) -> TrustBand {
 
 /// A GitHub subject whose fork ratio cleared the elevated threshold.
 #[derive(Debug, Clone, PartialEq)]
+pub struct TrustRow {
+    /// `owner/repo`.
+    pub key: String,
+    /// The composite summary (see [`TrustSummary`]).
+    pub summary: TrustSummary,
+}
+
+/// Composite trust rows for every tracked GitHub subject inside the
+/// window: fork ratio + org-burst membership + outlier z + age, blended
+/// by [`trust_summary`]. Sorted worst-first.
+///
+/// # Errors
+/// Propagates store failures.
+pub fn trust_rows(store: &Store, window_days: u32, min_stars: i64) -> Result<Vec<TrustRow>> {
+    let bursts = org_bursts(store, window_days, 3, 25.0)?;
+    let burst_owners: std::collections::HashSet<String> =
+        bursts.iter().map(|b| b.owner.clone()).collect();
+    let outliers = velocity_outliers(store, window_days, 2_000)?;
+    let z_by_key: std::collections::BTreeMap<String, f64> =
+        outliers.into_iter().map(|o| (o.key, o.robust_z)).collect();
+
+    let now_epoch_days = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        secs / 86_400
+    };
+
+    let window_secs = i64::from(window_days) * 86_400;
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "
+            WITH latest AS (SELECT subject_id, MAX(ts) AS ts FROM observations GROUP BY subject_id)
+            SELECT s.key, s.created_at, o.score, o.extra1
+            FROM observations o
+            JOIN latest l ON l.subject_id = o.subject_id AND l.ts = o.ts
+            JOIN subjects s ON s.subject_id = o.subject_id
+            WHERE s.kind = 'github_repo'
+              AND o.ts >= (SELECT MAX(ts) FROM observations) - ?1
+            ORDER BY o.extra1 * 1.0 / MAX(o.score, 1) DESC
+            ",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![window_secs, min_stars], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, created_at, stars, forks) = row?;
+            let owner = key.split('/').next().unwrap_or(&key).to_owned();
+            let age_days = created_at
+                .as_deref()
+                .map(|c| age_days_from(c, now_epoch_days))
+                .unwrap_or(0);
+            let z = z_by_key.get(&key).copied().unwrap_or(0.0);
+            let summary = trust_summary(
+                stars,
+                forks,
+                min_stars,
+                burst_owners.contains(&owner),
+                z,
+                age_days,
+            );
+            out.push(TrustRow { key, summary });
+        }
+        Ok(out)
+    })
+}
+
+/// Days between an RFC 3339 date prefix and `now_epoch_days`; 0 when
+/// unparseable.
+fn age_days_from(created_at: &str, now_epoch_days: i64) -> i64 {
+    let Some(day) = created_at.get(0..10) else {
+        return 0;
+    };
+    let mut parts = [1970i64, 1, 1];
+    for (i, chunk) in day.split('-').take(3).enumerate() {
+        if let Ok(v) = chunk.parse::<i64>() {
+            parts[i] = v;
+        }
+    }
+    let (y, m, d) = (parts[0], parts[1], parts[2]);
+    let days_before_month = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let y_days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1921) / 400;
+    now_epoch_days - (y_days + days_before_month[(m - 1).clamp(0, 11) as usize] + d - 1)
+}
+
+/// A GitHub subject whose fork ratio cleared the elevated threshold.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForkFlag {
     /// `owner/repo`.
     pub key: String,
@@ -444,7 +538,11 @@ mod tests {
         let farmed = trust_summary(1_000, 500, 200, true, 10.0, 5);
         assert_eq!(trust_band(farmed.score), TrustBand::Suspect);
         // 100 - 50*0.4 (20) - 25 (burst) - 10*2 (20) + 5/30 age = 35.167.
-        assert!((farmed.score - 35.1667).abs() < 0.01, "got {}", farmed.score);
+        assert!(
+            (farmed.score - 35.1667).abs() < 0.01,
+            "got {}",
+            farmed.score
+        );
 
         // Small samples skip the ratio penalty entirely.
         let tiny = trust_summary(50, 40, 200, false, 0.0, 400);
@@ -467,5 +565,25 @@ mod tests {
         assert_eq!(flags[0].key, "farm/a");
         assert_eq!(flags[0].verdict, ForkVerdict::Extreme);
         assert!((flags[0].ratio_pct - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trust_rows_score_farm_below_clean() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store, "farm/a", 5_000, 2_500, 100.0); // 50% ratio + burst member
+        seed(&store, "farm/b", 4_000, 2_000, 90.0);
+        seed(&store, "clean/c", 8_000, 300, 120.0);
+        let rows = trust_rows(&store, 14, 200).unwrap();
+        let farm = rows.iter().find(|r| r.key == "farm/a").unwrap();
+        let clean = rows.iter().find(|r| r.key == "clean/c").unwrap();
+        assert!(farm.summary.burst_member);
+        assert!(!clean.summary.burst_member);
+        assert!(
+            farm.summary.score < clean.summary.score,
+            "farm {} must score below clean {}",
+            farm.summary.score,
+            clean.summary.score
+        );
+        assert_eq!(trust_band(farm.summary.score), TrustBand::Suspect);
     }
 }
