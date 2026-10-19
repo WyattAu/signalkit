@@ -141,17 +141,15 @@ pub fn fork_flags(store: &Store, window_days: u32, min_stars: i64) -> Result<Vec
             ORDER BY o.extra1 * 1.0 / MAX(o.score, 1) DESC
             ",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![window_secs, min_stars], |row| {
-                let key: String = row.get(0)?;
-                let stars: i64 = row.get(1)?;
-                let forks: i64 = row.get(2)?;
-                Ok((key, stars, forks))
-            })
-            .map_err(rusqlite::Error::from)?;
+        let rows = stmt.query_map(rusqlite::params![window_secs, min_stars], |row| {
+            let key: String = row.get(0)?;
+            let stars: i64 = row.get(1)?;
+            let forks: i64 = row.get(2)?;
+            Ok((key, stars, forks))
+        })?;
         let mut out = Vec::new();
         for row in rows {
-            let (key, stars, forks) = row.map_err(rusqlite::Error::from)?;
+            let (key, stars, forks) = row?;
             let ratio_pct = forks as f64 * 100.0 / stars.max(1) as f64;
             let verdict = fork_verdict(stars, forks, min_stars);
             if verdict != ForkVerdict::Normal {
