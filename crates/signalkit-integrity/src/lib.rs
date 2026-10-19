@@ -242,7 +242,7 @@ pub fn trust_rows(store: &Store, window_days: u32, min_stars: i64) -> Result<Vec
             ORDER BY o.extra1 * 1.0 / MAX(o.score, 1) DESC
             ",
         )?;
-        let rows = stmt.query_map(rusqlite::params![window_secs, min_stars], |row| {
+        let rows = stmt.query_map(rusqlite::params![window_secs], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -572,6 +572,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed(&store, "farm/a", 5_000, 2_500, 100.0); // 50% ratio + burst member
         seed(&store, "farm/b", 4_000, 2_000, 90.0);
+        seed(&store, "farm/c", 3_000, 1_500, 80.0); // third repo trips min_repos=3
         seed(&store, "clean/c", 8_000, 300, 120.0);
         let rows = trust_rows(&store, 14, 200).unwrap();
         let farm = rows.iter().find(|r| r.key == "farm/a").unwrap();
@@ -584,6 +585,12 @@ mod tests {
             farm.summary.score,
             clean.summary.score
         );
-        assert_eq!(trust_band(farm.summary.score), TrustBand::Suspect);
+        // 100 - 20 (50% ratio x 0.4) - 25 (burst) - 0 (no outlier) + 0 age = 55.
+        assert_eq!(trust_band(farm.summary.score), TrustBand::Watch);
+        assert!(
+            (farm.summary.score - 55.0).abs() < 1.0,
+            "got {}",
+            farm.summary.score
+        );
     }
 }
