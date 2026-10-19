@@ -1,7 +1,7 @@
 [package]
 name = "signalkit-integrity"
 description = "Integrity signals for tracked subjects: fork-ratio verdicts, org-burst detection, velocity outliers"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
