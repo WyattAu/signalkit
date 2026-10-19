@@ -105,6 +105,98 @@ pub fn org_bursts(
     Ok(out)
 }
 
+/// A composite engagement-trust assessment over one GitHub subject.
+///
+/// **Experimental.** The score is a documented linear blend, not a
+/// judge: start at 100, subtract penalties for fork-ratio, org-burst
+/// membership, and velocity-outlier z, add a small bonus for age. Every
+/// component is returned alongside so consumers can show the evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustSummary {
+    /// Composite score, 0–100.
+    pub score: f64,
+    /// Fork ratio in percent.
+    pub fork_ratio_pct: f64,
+    /// Whether the subject's owner is in an org burst.
+    pub burst_member: bool,
+    /// Robust z of the subject's velocity (0 when not an outlier).
+    pub outlier_z: f64,
+    /// Repo age in days.
+    pub age_days: i64,
+}
+
+/// Weight: percent fork ratio costs up to 40 points.
+pub const WEIGHT_FORK_RATIO: f64 = 0.4;
+/// Weight: org-burst membership costs 25 points.
+pub const WEIGHT_ORG_BURST: f64 = 25.0;
+/// Weight: outlier z costs up to 20 points (z × 2, floored at 0).
+pub const WEIGHT_OUTLIER_Z: f64 = 2.0;
+/// Bonus: one point per 30 days of age, up to 10.
+pub const BONUS_AGE_PER_DAYS: f64 = 30.0;
+/// Bonus cap: 10 points.
+pub const BONUS_AGE_CAP: f64 = 10.0;
+
+/// Compute the composite trust summary for one subject's numbers.
+#[must_use]
+pub fn trust_summary(
+    stars: i64,
+    forks: i64,
+    min_stars: i64,
+    burst_member: bool,
+    outlier_z: f64,
+    age_days: i64,
+) -> TrustSummary {
+    let fork_ratio_pct = if stars > 0 {
+        forks as f64 * 100.0 / stars as f64
+    } else {
+        0.0
+    };
+    // Fork-ratio penalty only applies above the small-sample floor.
+    let ratio_penalty = if stars >= min_stars {
+        fork_ratio_pct
+    } else {
+        0.0
+    };
+    let z_penalty = outlier_z.max(0.0) * WEIGHT_OUTLIER_Z;
+    let age_bonus = (age_days as f64 / BONUS_AGE_PER_DAYS).min(BONUS_AGE_CAP);
+    let score = (100.0
+        - ratio_penalty * WEIGHT_FORK_RATIO
+        - if burst_member { WEIGHT_ORG_BURST } else { 0.0 }
+        - z_penalty
+        + age_bonus)
+        .clamp(0.0, 100.0);
+    TrustSummary {
+        score,
+        fork_ratio_pct,
+        burst_member,
+        outlier_z,
+        age_days,
+    }
+}
+
+/// Verdict band for a [`TrustSummary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustBand {
+    /// >= 80.
+    Trusted,
+    /// 50–79.
+    Watch,
+    /// < 50.
+    Suspect,
+}
+
+/// Band for a composite score.
+#[must_use]
+pub fn trust_band(score: f64) -> TrustBand {
+    if score >= 80.0 {
+        TrustBand::Trusted
+    } else if score >= 50.0 {
+        TrustBand::Watch
+    } else {
+        TrustBand::Suspect
+    }
+}
+
 /// A GitHub subject whose fork ratio cleared the elevated threshold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForkFlag {
@@ -335,6 +427,34 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed(&store, "lonely/a", 1_000, 10, 900.0);
         assert!(velocity_outliers(&store, 14, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trust_summary_penalizes_each_signal() {
+        // Clean, old repo: bonus applies, score pins at the cap.
+        let clean = trust_summary(5_000, 200, 200, false, 0.0, 600);
+        assert!(
+            (clean.score - 100.0).abs() < 1e-9,
+            "clean pins at 100, got {}",
+            clean.score
+        );
+        assert_eq!(trust_band(clean.score), TrustBand::Trusted);
+
+        // Farmed: 50% ratio + burst + z=10.
+        let farmed = trust_summary(1_000, 500, 200, true, 10.0, 5);
+        assert_eq!(trust_band(farmed.score), TrustBand::Suspect);
+        // 100 - 50*0.4 - 25 - 20 + 0 = 35.
+        assert!((farmed.score - 35.0).abs() < 1e-9, "got {}", farmed.score);
+
+        // Small samples skip the ratio penalty entirely.
+        let tiny = trust_summary(50, 40, 200, false, 0.0, 400);
+        assert!(tiny.score >= 100.0 - 1e-9);
+    }
+
+    #[test]
+    fn trust_score_is_clamped() {
+        let worst = trust_summary(1_000, 2_000, 200, true, 50.0, 0);
+        assert!((worst.score - 0.0).abs() < 1e-9);
     }
 
     #[test]
