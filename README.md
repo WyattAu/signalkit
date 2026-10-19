@@ -22,4 +22,5 @@ layers.
 - **Integrity is evidence-first**: verdicts ship with the numbers that
   produced them; thresholds are conservative and documented.
 
+[![CI](https://github.com/WyattAu/signalkit/actions/workflows/ci.yml/badge.svg)](https://github.com/WyattAu/signalkit/actions/workflows/ci.yml)
 Apache-2.0.
