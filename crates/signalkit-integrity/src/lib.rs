@@ -443,8 +443,8 @@ mod tests {
         // Farmed: 50% ratio + burst + z=10.
         let farmed = trust_summary(1_000, 500, 200, true, 10.0, 5);
         assert_eq!(trust_band(farmed.score), TrustBand::Suspect);
-        // 100 - 50*0.4 - 25 - 20 + 0 = 35.
-        assert!((farmed.score - 35.0).abs() < 1e-9, "got {}", farmed.score);
+        // 100 - 50*0.4 (20) - 25 (burst) - 10*2 (20) + 5/30 age = 35.167.
+        assert!((farmed.score - 35.1667).abs() < 0.01, "got {}", farmed.score);
 
         // Small samples skip the ratio penalty entirely.
         let tiny = trust_summary(50, 40, 200, false, 0.0, 400);
