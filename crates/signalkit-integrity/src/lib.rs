@@ -115,6 +115,9 @@ pub fn org_bursts(
 pub struct TrustSummary {
     /// Composite score, 0–100.
     pub score: f64,
+    /// Band after the single-signal cap: an extreme fork verdict can
+    /// never rate above Watch, however clean the rest of the shape is.
+    pub band: TrustBand,
     /// Fork ratio in percent.
     pub fork_ratio_pct: f64,
     /// Whether the subject's owner is in an org burst.
@@ -165,8 +168,17 @@ pub fn trust_summary(
         - z_penalty
         + age_bonus)
         .clamp(0.0, 100.0);
+    // Single-signal cap: no single signal may be ignored. An extreme
+    // fork verdict holds the band at Watch even when everything else
+    // looks clean.
+    let verdict = fork_verdict(stars, forks, min_stars);
+    let band = match trust_band(score) {
+        TrustBand::Trusted if verdict == ForkVerdict::Extreme => TrustBand::Watch,
+        other => other,
+    };
     TrustSummary {
         score,
+        band,
         fork_ratio_pct,
         burst_member,
         outlier_z,
@@ -533,6 +545,18 @@ mod tests {
             clean.score
         );
         assert_eq!(trust_band(clean.score), TrustBand::Trusted);
+
+        // The playgta5 shape: lone repo, ~49% ratio, no burst, no
+        // outlier, old enough for the full age bonus — the composite
+        // clears 80, but the extreme verdict caps the band at Watch.
+        // No single signal may be ignored.
+        let lone = trust_summary(1_688, 822, 200, false, 0.0, 400);
+        assert!(
+            lone.score > 80.0,
+            "score {} should clear the trusted line",
+            lone.score
+        );
+        assert_eq!(lone.band, TrustBand::Watch, "extreme verdict caps the band");
 
         // Farmed: 50% ratio + burst + z=10.
         let farmed = trust_summary(1_000, 500, 200, true, 10.0, 5);
