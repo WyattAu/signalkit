@@ -132,8 +132,10 @@ pub struct TrustSummary {
 pub const WEIGHT_FORK_RATIO: f64 = 0.4;
 /// Weight: org-burst membership costs 25 points.
 pub const WEIGHT_ORG_BURST: f64 = 25.0;
-/// Weight: outlier z costs up to 20 points (z × 2, floored at 0).
-pub const WEIGHT_OUTLIER_Z: f64 = 2.0;
+/// Weight: outlier z costs 2 points per z, capped at 10. Velocity
+/// outliers mark *attention-worthy* — a legitimately viral repo has a
+/// huge z and must not be nuked to zero for it.
+pub const OUTLIER_PENALTY_CAP: f64 = 10.0;
 /// Bonus: one point per 30 days of age, up to 10.
 pub const BONUS_AGE_PER_DAYS: f64 = 30.0;
 /// Bonus cap: 10 points.
@@ -160,7 +162,7 @@ pub fn trust_summary(
     } else {
         0.0
     };
-    let z_penalty = outlier_z.max(0.0) * WEIGHT_OUTLIER_Z;
+    let z_penalty = (outlier_z.max(0.0) * 2.0).min(OUTLIER_PENALTY_CAP);
     let age_bonus = (age_days as f64 / BONUS_AGE_PER_DAYS).min(BONUS_AGE_CAP);
     let score = (100.0
         - ratio_penalty * WEIGHT_FORK_RATIO
@@ -561,9 +563,10 @@ mod tests {
         // Farmed: 50% ratio + burst + z=10.
         let farmed = trust_summary(1_000, 500, 200, true, 10.0, 5);
         assert_eq!(trust_band(farmed.score), TrustBand::Suspect);
-        // 100 - 50*0.4 (20) - 25 (burst) - 10*2 (20) + 5/30 age = 35.167.
+        // 100 - 50*0.4 (20) - 25 (burst) - min(20,10) (outlier cap) + 5/30
+        // age = 45.167.
         assert!(
-            (farmed.score - 35.1667).abs() < 0.01,
+            (farmed.score - 45.1667).abs() < 0.01,
             "got {}",
             farmed.score
         );
