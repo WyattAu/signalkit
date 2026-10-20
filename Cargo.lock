@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "signalkit-integrity"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rusqlite",
  "signalkit-core",
