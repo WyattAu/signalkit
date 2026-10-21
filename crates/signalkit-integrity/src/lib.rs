@@ -60,7 +60,10 @@ pub struct BurstGroup {
 }
 
 /// Detect org bursts: GitHub owners with at least `min_repos` subjects
-/// above `velocity_floor` per day inside the window.
+/// above `velocity_floor` per day inside the window. Two-repo orgs
+/// qualify when their combined velocity clears `high_velocity_floor` —
+/// the Gathin23 shape: 2 repos, 10.6k stars/day combined, invisible to
+/// a pure min-repos rule.
 ///
 /// # Errors
 /// Propagates store failures.
@@ -69,6 +72,7 @@ pub fn org_bursts(
     window_days: u32,
     min_repos: usize,
     velocity_floor: f64,
+    high_velocity_floor: f64,
 ) -> Result<Vec<BurstGroup>> {
     let rows = store.velocity_rows(window_days, 5_000)?;
     let mut groups: std::collections::BTreeMap<String, Vec<(String, f64)>> =
@@ -85,11 +89,16 @@ pub fn org_bursts(
     }
     let mut out = Vec::new();
     for (owner, mut subjects) in groups {
-        if subjects.len() < min_repos {
+        let combined: f64 = subjects.iter().map(|(_, v)| v).sum();
+        // Full min-repos rule, or the two-repo high-velocity shape
+        // (Gathin23: 2 repos, 10.6k stars/day combined).
+        let qualifies =
+            subjects.len() >= min_repos || (subjects.len() >= 2 && combined >= high_velocity_floor);
+        if !qualifies {
             continue;
         }
         subjects.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let combined_velocity: f64 = subjects.iter().map(|(_, v)| v).sum();
+        let combined_velocity = combined;
         out.push(BurstGroup {
             keys: subjects.iter().map(|(k, _)| k.clone()).collect(),
             owner,
@@ -227,7 +236,7 @@ pub struct TrustRow {
 /// # Errors
 /// Propagates store failures.
 pub fn trust_rows(store: &Store, window_days: u32, min_stars: i64) -> Result<Vec<TrustRow>> {
-    let bursts = org_bursts(store, window_days, 3, 25.0)?;
+    let bursts = org_bursts(store, window_days, 3, 25.0, 5_000.0)?;
     let burst_owners: std::collections::HashSet<String> =
         bursts.iter().map(|b| b.owner.clone()).collect();
     let outliers = velocity_outliers(store, window_days, 2_000)?;
@@ -350,14 +359,13 @@ pub fn name_clones(
               AND o.score > 0
             ",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![window_secs], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
+        let rows = stmt.query_map(rusqlite::params![window_secs], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
 
         // name -> (owner set, stars, forks)
         let mut clusters: std::collections::BTreeMap<
@@ -604,7 +612,7 @@ mod tests {
         seed(&store, "farm/a", 5_000, 2_500, 100.0);
         seed(&store, "farm/b", 4_000, 2_000, 90.0);
         seed(&store, "honest/c", 8_000, 300, 120.0);
-        let bursts = org_bursts(&store, 14, 2, 50.0).unwrap();
+        let bursts = org_bursts(&store, 14, 2, 50.0, 5_000.0).unwrap();
         assert_eq!(bursts.len(), 1);
         assert_eq!(bursts[0].owner, "farm");
         assert_eq!(bursts[0].subjects, 2);
@@ -713,6 +721,28 @@ mod tests {
             store.insert_observation(id, &obs(0, 270, 269)).unwrap();
         }
         assert!(name_clones(&store, 14, 3, 40.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn org_bursts_catch_two_repo_high_velocity_orgs() {
+        // The Gathin23 shape: two repos, ~10.6k stars/day combined, no
+        // third repo — invisible to min_repos=3, caught by the
+        // high-velocity floor.
+        let store = Store::open_in_memory().unwrap();
+        seed(&store, "gathin/tv", 12_500, 1_399, 8_263.0);
+        seed(&store, "gathin/vibe", 2_674, 500, 2_389.0);
+        let bursts = org_bursts(&store, 14, 3, 25.0, 5_000.0).unwrap();
+        assert_eq!(bursts.len(), 1);
+        assert_eq!(bursts[0].owner, "gathin");
+        assert!((bursts[0].combined_velocity - 10_652.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn org_bursts_ignore_calm_pairs() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store, "calm/a", 1_000, 50, 20.0);
+        seed(&store, "calm/b", 1_000, 50, 20.0);
+        assert!(org_bursts(&store, 14, 3, 25.0, 5_000.0).unwrap().is_empty());
     }
 
     #[test]
