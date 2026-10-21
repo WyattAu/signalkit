@@ -305,6 +305,102 @@ fn age_days_from(created_at: &str, now_epoch_days: i64) -> i64 {
     now_epoch_days - (y_days + days_before_month[(m - 1).clamp(0, 11) as usize] + d - 1)
 }
 
+/// A cluster of same-named repos spread across distinct orgs with
+/// farm-shaped engagement — the "template cloned into many throwaway
+/// orgs" signature (e.g. four orgs each shipping a `.github` at ~99%
+/// fork ratio).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NameCloneGroup {
+    /// Repo name shared by the cluster.
+    pub name: String,
+    /// Distinct owners in the cluster.
+    pub orgs: Vec<String>,
+    /// Combined stars.
+    pub total_stars: i64,
+    /// Combined forks.
+    pub total_forks: i64,
+    /// Forks per 100 stars across the cluster.
+    pub avg_ratio_pct: f64,
+}
+
+/// Detect same-name clone clusters: at least `min_orgs` distinct owners
+/// shipping a repo with the same name, where the cluster's aggregate
+/// fork ratio clears `min_ratio_pct`. Only GitHub subjects inside the
+/// window are considered.
+///
+/// # Errors
+/// Propagates store failures.
+pub fn name_clones(
+    store: &Store,
+    window_days: u32,
+    min_orgs: usize,
+    min_ratio_pct: f64,
+) -> Result<Vec<NameCloneGroup>> {
+    let window_secs = i64::from(window_days) * 86_400;
+    store.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "
+            WITH latest AS (SELECT subject_id, MAX(ts) AS ts FROM observations GROUP BY subject_id)
+            SELECT s.key, o.score, o.extra1
+            FROM observations o
+            JOIN latest l ON l.subject_id = o.subject_id AND l.ts = o.ts
+            JOIN subjects s ON s.subject_id = o.subject_id
+            WHERE s.kind = 'github_repo'
+              AND o.ts >= (SELECT MAX(ts) FROM observations) - ?1
+              AND o.score > 0
+            ",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![window_secs], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+
+        // name -> (owner set, stars, forks)
+        let mut clusters: std::collections::BTreeMap<
+            String,
+            (std::collections::BTreeSet<String>, i64, i64),
+        > = std::collections::BTreeMap::new();
+        for row in rows {
+            let (key, stars, forks) = row?;
+            let Some((owner, name)) = key.split_once('/') else {
+                continue;
+            };
+            let entry = clusters.entry(name.to_owned()).or_default();
+            entry.0.insert(owner.to_owned());
+            entry.1 += stars;
+            entry.2 += forks;
+        }
+
+        let mut out = Vec::new();
+        for (name, (owners, total_stars, total_forks)) in clusters {
+            if owners.len() < min_orgs {
+                continue;
+            }
+            let avg_ratio_pct = total_forks as f64 * 100.0 / total_stars.max(1) as f64;
+            if avg_ratio_pct < min_ratio_pct {
+                continue;
+            }
+            out.push(NameCloneGroup {
+                name,
+                orgs: owners.into_iter().collect(),
+                total_stars,
+                total_forks,
+                avg_ratio_pct,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.avg_ratio_pct
+                .partial_cmp(&a.avg_ratio_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(out)
+    })
+}
+
 /// A GitHub subject whose fork ratio cleared the elevated threshold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForkFlag {
@@ -580,6 +676,43 @@ mod tests {
     fn trust_score_is_clamped() {
         let worst = trust_summary(1_000, 2_000, 200, true, 50.0, 0);
         assert!((worst.score - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn name_clones_catch_cross_org_farms() {
+        let store = Store::open_in_memory().unwrap();
+        // Four orgs, same name `.github`, all farm ratios.
+        for owner in ["fort-tool", "cod-tool", "cs2-tools-new", "apex-pro12"] {
+            let id = store
+                .upsert_subject(&repo(&format!("{owner}/.github")))
+                .unwrap();
+            store.insert_observation(id, &obs(0, 270, 269)).unwrap();
+        }
+        // A legit same-name cluster with normal ratios must not flag.
+        for owner in ["alice", "bob"] {
+            let id = store
+                .upsert_subject(&repo(&format!("{owner}/cli")))
+                .unwrap();
+            store.insert_observation(id, &obs(0, 5_000, 200)).unwrap();
+        }
+
+        let groups = name_clones(&store, 14, 3, 40.0).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, ".github");
+        assert_eq!(groups[0].orgs.len(), 4);
+        assert!(groups[0].avg_ratio_pct > 95.0);
+    }
+
+    #[test]
+    fn name_clones_respect_min_orgs() {
+        let store = Store::open_in_memory().unwrap();
+        for owner in ["o1", "o2"] {
+            let id = store
+                .upsert_subject(&repo(&format!("{owner}/.github")))
+                .unwrap();
+            store.insert_observation(id, &obs(0, 270, 269)).unwrap();
+        }
+        assert!(name_clones(&store, 14, 3, 40.0).unwrap().is_empty());
     }
 
     #[test]
