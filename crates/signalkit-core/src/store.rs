@@ -334,6 +334,80 @@ impl Store {
         Ok(out)
     }
 
+    /// Subjects observed on at least `min_days` distinct UTC days inside
+    /// the window, strongest velocity first — the persistence signal.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn persistent_subjects(
+        &self,
+        window_days: u32,
+        min_days: i64,
+        limit: u32,
+    ) -> Result<Vec<crate::model::PersistentRow>> {
+        let window_secs = i64::from(window_days) * 86_400;
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "
+                WITH window_obs AS (
+                    SELECT o.subject_id, o.ts, o.score
+                    FROM observations o
+                    WHERE o.ts >= (SELECT MAX(ts) FROM observations) - ?1
+                ),
+                per_subject AS (
+                    SELECT subject_id,
+                           COUNT(DISTINCT date(ts, 'unixepoch')) AS days,
+                           MIN(ts) AS first_ts,
+                           MAX(ts) AS last_ts
+                    FROM window_obs GROUP BY subject_id
+                )
+                SELECT s.kind, s.key, p.days,
+                       (SELECT score FROM window_obs w
+                         WHERE w.subject_id = p.subject_id
+                           AND w.ts = p.last_ts),
+                       (SELECT score FROM window_obs w
+                         WHERE w.subject_id = p.subject_id
+                           AND w.ts = p.first_ts),
+                       p.last_ts - p.first_ts
+                FROM per_subject p
+                JOIN subjects s ON s.subject_id = p.subject_id
+                WHERE p.days >= ?2
+                ORDER BY p.days DESC,
+                         (SELECT score FROM window_obs w
+                           WHERE w.subject_id = p.subject_id
+                             AND w.ts = p.last_ts)
+                       - (SELECT score FROM window_obs w
+                           WHERE w.subject_id = p.subject_id
+                             AND w.ts = p.first_ts) DESC
+                LIMIT ?3
+                ",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![window_secs, min_days, i64::from(limit)],
+                |row| {
+                    let kind_raw: String = row.get(0)?;
+                    let key: String = row.get(1)?;
+                    let days: i64 = row.get(2)?;
+                    let now: i64 = row.get(3)?;
+                    let before: i64 = row.get(4)?;
+                    let span_secs: i64 = row.get(5)?;
+                    Ok(crate::model::PersistentRow {
+                        kind: SourceKind::parse(&kind_raw).unwrap_or(SourceKind::GithubRepo),
+                        key,
+                        days,
+                        score_now: now,
+                        velocity_per_day: score::velocity_per_day(before, now, span_secs),
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Replace the stored personal profile with `rows`.
     ///
     /// # Errors
@@ -538,6 +612,36 @@ mod tests {
         assert_eq!(rows[0].score_now, 5_000);
         assert_eq!(rows[0].score_prev, 5_000);
         assert_eq!(rows[0].topics, vec!["serialization".to_owned()]);
+    }
+
+    #[test]
+    fn persistence_counts_distinct_days() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .upsert_subject(&subject(
+                SourceKind::GithubRepo,
+                "wave/persistent",
+                None,
+                &[],
+            ))
+            .unwrap();
+        // Day 1: two observations (same UTC day counts once).
+        store.insert_observation(id, &obs(0, 100)).unwrap();
+        store.insert_observation(id, &obs(3_600, 150)).unwrap();
+        // Day 2.
+        store.insert_observation(id, &obs(86_400, 400)).unwrap();
+        // Day 3.
+        store.insert_observation(id, &obs(172_800, 900)).unwrap();
+
+        let rows = store.persistent_subjects(14, 2, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].days, 3);
+        // 800 stars over 2 days = 400/day.
+        assert!((rows[0].velocity_per_day - 400.0).abs() < 1e-9);
+        assert_eq!(rows[0].score_now, 900);
+
+        // min_days=4 filters it out.
+        assert!(store.persistent_subjects(14, 4, 10).unwrap().is_empty());
     }
 
     #[test]

@@ -120,6 +120,23 @@ pub struct RepoListed {
     pub stars: i64,
 }
 
+/// A subject that kept appearing across distinct days — persistence is
+/// the strongest wave signal: single-day spikes fade, multi-day
+/// presence compounds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistentRow {
+    /// Subject type.
+    pub kind: SourceKind,
+    /// Source-stable identifier.
+    pub key: String,
+    /// Distinct UTC days with at least one observation in the window.
+    pub days: i64,
+    /// Most recent observed score.
+    pub score_now: i64,
+    /// Velocity per day across the window.
+    pub velocity_per_day: f64,
+}
+
 /// A velocity computation for one subject over a snapshot window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VelocityRow {

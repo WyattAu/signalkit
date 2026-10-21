@@ -14,6 +14,6 @@ pub mod source;
 pub mod store;
 
 pub use error::{Result, TrendError};
-pub use model::{Observation, SourceKind, SubjectRecord, VelocityRow};
+pub use model::{Observation, PersistentRow, RepoListed, SourceKind, SubjectRecord, VelocityRow};
 pub use source::{CollectCtx, CollectReport, TrendSource};
 pub use store::Store;
