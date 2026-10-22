@@ -114,6 +114,40 @@ pub fn org_bursts(
     Ok(out)
 }
 
+/// Trend shape of consecutive per-day velocities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendShape {
+    /// Later velocity exceeds the earlier by >15%.
+    Accelerating,
+    /// Within ±15% of the earlier velocity.
+    Steady,
+    /// Later velocity falls below the earlier by >15%.
+    Fading,
+}
+
+/// Classify consecutive per-day velocities into a [`TrendShape`].
+///
+/// Needs at least two entries; extra history is ignored (only the last
+/// two velocities decide). A zero baseline is allowed — `0 -> 3` reads
+/// as accelerating.
+#[must_use]
+pub fn classify_shape(velocities: &[f64]) -> TrendShape {
+    if velocities.len() < 2 {
+        return TrendShape::Steady;
+    }
+    let (earlier, later) = (
+        velocities[velocities.len() - 2],
+        velocities[velocities.len() - 1],
+    );
+    if later > earlier * 1.15 {
+        TrendShape::Accelerating
+    } else if later < earlier * 0.85 {
+        TrendShape::Fading
+    } else {
+        TrendShape::Steady
+    }
+}
+
 /// A composite engagement-trust assessment over one GitHub subject.
 ///
 /// **Experimental.** The score is a documented linear blend, not a
@@ -755,6 +789,23 @@ mod tests {
         assert_eq!(flags[0].key, "farm/a");
         assert_eq!(flags[0].verdict, ForkVerdict::Extreme);
         assert!((flags[0].ratio_pct - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn classify_shape_thresholds() {
+        assert_eq!(classify_shape(&[10.0, 30.0]), TrendShape::Accelerating);
+        assert_eq!(classify_shape(&[10.0, 11.0]), TrendShape::Steady);
+        assert_eq!(classify_shape(&[30.0, 10.0]), TrendShape::Fading);
+        // Zero baseline: 0 -> 3 is accelerating, 0 -> 0 is steady.
+        assert_eq!(classify_shape(&[0.0, 3.0]), TrendShape::Accelerating);
+        assert_eq!(classify_shape(&[0.0, 0.0]), TrendShape::Steady);
+        // Only the last pair decides.
+        assert_eq!(
+            classify_shape(&[5.0, 5.0, 5.0, 40.0]),
+            TrendShape::Accelerating
+        );
+        // Single point: steady by definition.
+        assert_eq!(classify_shape(&[7.0]), TrendShape::Steady);
     }
 
     #[test]
