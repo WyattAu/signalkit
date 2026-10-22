@@ -408,6 +408,43 @@ impl Store {
         })
     }
 
+    /// Per-day max scores for every subject observed inside the window
+    /// — the series behind shape classification.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub fn daily_scores(&self, window_days: u32) -> Result<Vec<crate::model::DailyScore>> {
+        let window_secs = i64::from(window_days) * 86_400;
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "
+                SELECT s.kind, s.key,
+                       date(o.ts, 'unixepoch') AS day,
+                       MAX(o.score) AS score
+                FROM observations o
+                JOIN subjects s ON s.subject_id = o.subject_id
+                WHERE o.ts >= (SELECT MAX(ts) FROM observations) - ?1
+                GROUP BY s.subject_id, day
+                ORDER BY s.key, day
+                ",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![window_secs], |row| {
+                Ok(crate::model::DailyScore {
+                    kind: SourceKind::parse(&row.get::<_, String>(0)?)
+                        .unwrap_or(SourceKind::GithubRepo),
+                    key: row.get(1)?,
+                    day: row.get(2)?,
+                    score: row.get(3)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Replace the stored personal profile with `rows`.
     ///
     /// # Errors
@@ -642,6 +679,25 @@ mod tests {
 
         // min_days=4 filters it out.
         assert!(store.persistent_subjects(14, 4, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn daily_scores_group_by_day() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .upsert_subject(&subject(SourceKind::GithubRepo, "w/x", None, &[]))
+            .unwrap();
+        store.insert_observation(id, &obs(0, 100)).unwrap();
+        store.insert_observation(id, &obs(1_000, 250)).unwrap(); // same day
+        store.insert_observation(id, &obs(90_000, 400)).unwrap(); // next day
+
+        let series = store.daily_scores(14).unwrap();
+        let mine: Vec<_> = series.iter().filter(|d| d.key == "w/x").collect();
+        assert_eq!(mine.len(), 2); // not 3 — per-day max
+        assert_eq!(mine[0].score, 250);
+        assert_eq!(mine[1].score, 400);
+        assert_eq!(mine[0].day, "1970-01-01");
+        assert_eq!(mine[1].day, "1970-01-02");
     }
 
     #[test]

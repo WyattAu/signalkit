@@ -120,6 +120,20 @@ pub struct RepoListed {
     pub stars: i64,
 }
 
+/// One day's closing score for a subject — the raw material for shape
+/// classification (see `signalkit_integrity::classify_shape`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyScore {
+    /// Subject type.
+    pub kind: SourceKind,
+    /// Source-stable identifier.
+    pub key: String,
+    /// UTC date, `YYYY-MM-DD`.
+    pub day: String,
+    /// Max observed score that day.
+    pub score: i64,
+}
+
 /// A subject that kept appearing across distinct days — persistence is
 /// the strongest wave signal: single-day spikes fade, multi-day
 /// presence compounds.
