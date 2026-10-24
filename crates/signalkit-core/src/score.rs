@@ -37,6 +37,117 @@ pub fn personal_score(velocity_per_day: f64, topic_overlap: usize, language_matc
     overlap + language + velocity
 }
 
+/// A next-period projection from naive recency-weighted extrapolation.
+///
+/// `delta` is the projected score change over the next day; `low`/`high`
+/// are the ±1-sigma band; `confidence` is 0–1, scaling with history
+/// length. A projection from fewer than 2 prior deltas cannot exist, so
+/// callers gate on history length themselves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projection {
+    /// Projected next-day delta.
+    pub delta: f64,
+    /// Lower band of the ±1-sigma interval.
+    pub low: f64,
+    /// Upper band of the ±1-sigma interval.
+    pub high: f64,
+    /// 0–1 confidence, scaling with the number of history days.
+    pub confidence: f64,
+}
+
+/// Recency weight for the k-th delta back (k = 0 is the most recent):
+/// each step back halves the weight, floored so the total stays finite.
+fn recency_weight(steps_back: usize) -> f64 {
+    0.5f64.powi(steps_back as i32)
+}
+
+/// Project the next-day delta from consecutive day-over-day deltas.
+///
+/// Weighted mean of the deltas (most recent weighs most), spread from
+/// the deltas' standard deviation, band = projected ± spread. This is
+/// deliberately naive: with under a week of history, honest
+/// extrapolation beats a model that would overfit.
+#[must_use]
+pub fn project_next(deltas: &[f64]) -> Projection {
+    let n = deltas.len();
+    if n == 0 {
+        return Projection {
+            delta: 0.0,
+            low: 0.0,
+            high: 0.0,
+            confidence: 0.0,
+        };
+    }
+    let weights: Vec<f64> = (0..n).map(|k| recency_weight(n - 1 - k)).collect();
+    let total_w: f64 = weights.iter().sum();
+    let delta = deltas.iter().zip(&weights).map(|(d, w)| d * w).sum::<f64>() / total_w;
+    let variance = deltas
+        .iter()
+        .zip(&weights)
+        .map(|(d, w)| w * (d - delta) * (d - delta))
+        .sum::<f64>()
+        / total_w;
+    let spread = variance.sqrt();
+    let confidence = (n as f64 / 7.0).min(1.0);
+    Projection {
+        delta,
+        low: delta - spread,
+        high: delta + spread,
+        confidence,
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn recency_weighting_pulls_toward_recent() {
+        // 100 then 300: flat mean 200, weighted toward 300.
+        let p = project_next(&[100.0, 300.0]);
+        assert!(p.delta > 200.0, "delta {}", p.delta);
+        assert!(p.delta < 300.0);
+    }
+
+    #[test]
+    fn constant_history_projects_flat() {
+        let p = project_next(&[50.0, 50.0, 50.0, 50.0]);
+        assert!((p.delta - 50.0).abs() < 1e-9);
+        // Zero variance: the band collapses onto the projection.
+        assert!((p.low - 50.0).abs() < 1e-9 && (p.high - 50.0).abs() < 1e-9);
+        // 4 days of history: confidence below the 7-day cap.
+        assert!(p.confidence < 1.0);
+    }
+
+    #[test]
+    fn confidence_scales_with_days() {
+        let short = project_next(&[10.0, 20.0]);
+        let long = project_next(&[10.0, 20.0, 10.0, 20.0, 10.0, 20.0, 10.0, 20.0]);
+        assert!(long.confidence > short.confidence);
+        assert!((long.confidence - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn band_covers_recent_deltas() {
+        let history = [10.0, 12.0, 11.0, 13.0, 12.0];
+        let p = project_next(&history);
+        // The band brackets the projection and is tighter than the raw
+        // range of the historical deltas.
+        assert!(p.low <= p.delta && p.delta <= p.high);
+        let range = 13.0 - 10.0;
+        assert!(p.high - p.low < range);
+    }
+
+    #[test]
+    fn empty_history_projects_zero() {
+        let p = project_next(&[]);
+        assert_eq!(p.delta, 0.0);
+        assert_eq!(p.confidence, 0.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
