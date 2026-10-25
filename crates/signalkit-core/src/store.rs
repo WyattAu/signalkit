@@ -421,6 +421,40 @@ impl Store {
             .map_err(TrendError::from)
     }
 
+    /// Per-day count of GitHub subjects whose key ends with
+    /// `key_suffix` and whose fork ratio that day reached
+    /// `min_ratio_pct` — the growth curve of a name-cluster farm.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn fork_cluster_days(
+        &self,
+        key_suffix: &str,
+        min_ratio_pct: f64,
+    ) -> Result<Vec<(String, i64)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT date(o.ts, 'unixepoch') AS day,
+                        COUNT(DISTINCT s.key) AS orgs
+                 FROM observations o
+                 JOIN subjects s ON s.subject_id = o.subject_id
+                 WHERE s.kind = 'github_repo'
+                   AND s.key LIKE '%' || ?1
+                   AND o.score > 0
+                   AND o.extra1 * 100.0 / o.score >= ?2
+                 GROUP BY day ORDER BY day",
+            )
+            .map_err(TrendError::from)?;
+        let rows = stmt
+            .query_map(params![key_suffix, min_ratio_pct], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(TrendError::from)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(TrendError::from)
+    }
+
     /// `(subject count, observation count)` for report headers.
     ///
     /// # Errors
@@ -942,6 +976,43 @@ mod tests {
         assert!(syn.3);
         // Scored rows leave the due queue.
         assert!(store.due_forecasts("2026-10-27").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fork_cluster_days_counts_by_day() {
+        let store = Store::open_in_memory().unwrap();
+        // Two cluster orgs, one clean repo.
+        for (key, stars, forks, day) in [
+            ("a/.github", 250, 240, 0),
+            ("b/.github", 250, 100, 0),
+            ("clean/repo", 5_000, 300, 0),
+            ("a/.github", 260, 255, 86_400),
+            ("b/.github", 260, 240, 86_400),
+            ("c/.github", 270, 265, 86_400),
+        ] {
+            let id = store
+                .upsert_subject(&subject(SourceKind::GithubRepo, key, None, &[]))
+                .unwrap();
+            store
+                .insert_observation(
+                    id,
+                    &Observation {
+                        ts: 1_770_000_000 + day,
+                        score: stars,
+                        extra1: forks,
+                        extra2: 0,
+                    },
+                )
+                .unwrap();
+        }
+        let days = store.fork_cluster_days("/.github", 20.0).unwrap();
+        // Day 1: a (96%) and b (40%) clear 20 percent. Day 2: all three.
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0], ("2026-02-02".to_owned(), 2));
+        assert_eq!(days[1], ("2026-02-03".to_owned(), 3));
+        // The clean repo never counts, whatever the suffix.
+        let none = store.fork_cluster_days("/repo", 20.0).unwrap();
+        assert!(none.is_empty() || none.iter().all(|(_, n)| *n == 0));
     }
 
     #[test]
