@@ -1,6 +1,6 @@
 [package]
 name = "signalkit"
-description = "Snapshot, store, and score any counter — umbrella crate for signalkit-core + signalkit-integrity"
+description = "Snapshot, store, and score any counter: umbrella crate for signalkit-core + signalkit-integrity"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
