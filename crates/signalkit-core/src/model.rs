@@ -19,8 +19,6 @@ pub enum SourceKind {
     Crate,
     /// HuggingFace model; score = downloads.
     HfModel,
-    /// SEC EDGAR filer; score = cumulative filings tracked.
-    Edgar,
 }
 
 impl SourceKind {
@@ -32,7 +30,6 @@ impl SourceKind {
             SourceKind::HnStory => "hn_story",
             SourceKind::Crate => "crate",
             SourceKind::HfModel => "hf_model",
-            SourceKind::Edgar => "edgar",
         }
     }
 
@@ -44,7 +41,6 @@ impl SourceKind {
             SourceKind::HnStory => "HN",
             SourceKind::Crate => "CR",
             SourceKind::HfModel => "HF",
-            SourceKind::Edgar => "ED",
         }
     }
 
@@ -56,7 +52,6 @@ impl SourceKind {
             "hn_story" => Some(SourceKind::HnStory),
             "crate" => Some(SourceKind::Crate),
             "hf_model" => Some(SourceKind::HfModel),
-            "edgar" => Some(SourceKind::Edgar),
             _ => None,
         }
     }
