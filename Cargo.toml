@@ -19,7 +19,7 @@ cognitive_complexity = "allow"
 too_many_arguments = "warn"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.95"
 authors = ["Wyatt Au"]
@@ -32,7 +32,7 @@ keywords = ["metrics", "velocity", "trends", "analytics", "sqlite"]
 categories = ["development-tools", "database"]
 
 [workspace.dependencies]
-signalkit-core = { path = "crates/signalkit-core", version = "0.2.0" }
+signalkit-core = { path = "crates/signalkit-core", version = "0.2.1" }
 signalkit-integrity = { path = "crates/signalkit-integrity", version = "0.3.0" }
 clock-kit = "0.1"
 fetch-kit = "0.2"

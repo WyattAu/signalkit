@@ -177,6 +177,8 @@ impl Store {
                 actual    REAL,
                 band_hit  INTEGER
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_forecasts_target
+                ON forecasts (for_day, kind, key);
             CREATE INDEX IF NOT EXISTS idx_forecasts_due
                 ON forecasts (for_day) WHERE actual IS NULL;
             ",
@@ -320,7 +322,13 @@ impl Store {
             .prepare(
                 "INSERT INTO forecasts
                  (made_on, for_day, kind, key, projected, low, high, estimator)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (for_day, kind, key) DO UPDATE SET
+                 made_on = excluded.made_on,
+                 projected = excluded.projected,
+                 low = excluded.low,
+                 high = excluded.high,
+                 estimator = excluded.estimator",
             )
             .map_err(TrendError::from)?;
         for r in rows {
