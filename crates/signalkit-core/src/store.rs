@@ -156,6 +156,12 @@ impl Store {
                 pages   INTEGER NOT NULL,
                 items   INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS digest_runs (
+                run_id  INTEGER PRIMARY KEY,
+                ts      INTEGER NOT NULL,
+                ok      INTEGER NOT NULL,
+                detail  TEXT NOT NULL DEFAULT ''
+            );
             ",
         )
         .map_err(TrendError::from)?;
@@ -244,6 +250,38 @@ impl Store {
             "SELECT ts, source, items FROM collect_runs ORDER BY run_id DESC LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(TrendError::from)
+    }
+
+    /// Record a digest attempt: delivered (`ok`) or failed with detail.
+    ///
+    /// Digest delivery is best-effort by design, so failures must be
+    /// queryable somewhere other than a journal that may not keep them.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn record_digest(&self, ts: i64, ok: bool, detail: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO digest_runs (ts, ok, detail) VALUES (?1, ?2, ?3)",
+            params![ts, i64::from(ok), detail],
+        )
+        .map_err(TrendError::from)?;
+        Ok(())
+    }
+
+    /// The most recent digest attempt, if any.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn last_digest(&self) -> Result<Option<(i64, bool, String)>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT ts, ok, detail FROM digest_runs ORDER BY run_id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?)),
         )
         .optional()
         .map_err(TrendError::from)
@@ -698,6 +736,28 @@ mod tests {
         assert_eq!(mine[1].score, 400);
         assert_eq!(mine[0].day, "1970-01-01");
         assert_eq!(mine[1].day, "1970-01-02");
+    }
+
+    #[test]
+    fn digest_runs_record_and_read_back() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.last_digest().unwrap().is_none());
+        store
+            .record_digest(1_000, false, "read token file: permission denied")
+            .unwrap();
+        store.record_digest(2_000, true, "").unwrap();
+        let (ts, ok, detail) = store.last_digest().unwrap().unwrap();
+        assert_eq!(ts, 2_000);
+        assert!(ok);
+        assert_eq!(detail, "");
+        // A fresh failure overwrites recency: the latest row wins.
+        store
+            .record_digest(3_000, false, "telegram 429: too many requests")
+            .unwrap();
+        let (ts, ok, detail) = store.last_digest().unwrap().unwrap();
+        assert_eq!(ts, 3_000);
+        assert!(!ok);
+        assert_eq!(detail, "telegram 429: too many requests");
     }
 
     #[test]
