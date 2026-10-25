@@ -19,6 +19,8 @@ pub enum SourceKind {
     Crate,
     /// HuggingFace model; score = downloads.
     HfModel,
+    /// SEC EDGAR filer; score = cumulative filings tracked.
+    Edgar,
 }
 
 impl SourceKind {
@@ -30,6 +32,7 @@ impl SourceKind {
             SourceKind::HnStory => "hn_story",
             SourceKind::Crate => "crate",
             SourceKind::HfModel => "hf_model",
+            SourceKind::Edgar => "edgar",
         }
     }
 
@@ -41,6 +44,7 @@ impl SourceKind {
             SourceKind::HnStory => "HN",
             SourceKind::Crate => "CR",
             SourceKind::HfModel => "HF",
+            SourceKind::Edgar => "ED",
         }
     }
 
@@ -52,6 +56,7 @@ impl SourceKind {
             "hn_story" => Some(SourceKind::HnStory),
             "crate" => Some(SourceKind::Crate),
             "hf_model" => Some(SourceKind::HfModel),
+            "edgar" => Some(SourceKind::Edgar),
             _ => None,
         }
     }
@@ -132,6 +137,43 @@ pub struct DailyScore {
     pub day: String,
     /// Max observed score that day.
     pub score: i64,
+}
+
+/// One projection to persist: made on some day, targeting the next.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForecastInput<'a> {
+    /// Subject type.
+    pub kind: SourceKind,
+    /// Source-stable identifier.
+    pub key: &'a str,
+    /// Projected next-day delta.
+    pub projected: f64,
+    /// Lower band of the calibrated interval.
+    pub low: f64,
+    /// Upper band of the calibrated interval.
+    pub high: f64,
+    /// Which estimator produced this: `walk` or `mean`.
+    pub estimator: &'a str,
+}
+
+/// A persisted forecast whose target day has arrived and can now be
+/// scored against the observed delta.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DueForecast {
+    /// Row id, for [`crate::store::Store::score_forecast`].
+    pub id: i64,
+    /// The day the projection targeted, `YYYY-MM-DD`.
+    pub for_day: String,
+    /// Subject type.
+    pub kind: SourceKind,
+    /// Source-stable identifier.
+    pub key: String,
+    /// Projected next-day delta.
+    pub projected: f64,
+    /// Lower band of the calibrated interval.
+    pub low: f64,
+    /// Upper band of the calibrated interval.
+    pub high: f64,
 }
 
 /// A subject that kept appearing across distinct days — persistence is

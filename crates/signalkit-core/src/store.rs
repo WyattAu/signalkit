@@ -14,7 +14,9 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{Result, TrendError};
-use crate::model::{Observation, RepoListed, SourceKind, SubjectRecord, VelocityRow};
+use crate::model::{
+    DueForecast, ForecastInput, Observation, RepoListed, SourceKind, SubjectRecord, VelocityRow,
+};
 use crate::score;
 
 /// Topics are joined with this separator inside a single TEXT column.
@@ -162,6 +164,21 @@ impl Store {
                 ok      INTEGER NOT NULL,
                 detail  TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS forecasts (
+                id        INTEGER PRIMARY KEY,
+                made_on   TEXT NOT NULL,
+                for_day   TEXT NOT NULL,
+                kind      TEXT NOT NULL,
+                key       TEXT NOT NULL,
+                projected REAL NOT NULL,
+                low       REAL NOT NULL,
+                high      REAL NOT NULL,
+                estimator TEXT NOT NULL,
+                actual    REAL,
+                band_hit  INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_forecasts_due
+                ON forecasts (for_day) WHERE actual IS NULL;
             ",
         )
         .map_err(TrendError::from)?;
@@ -285,6 +302,115 @@ impl Store {
         )
         .optional()
         .map_err(TrendError::from)
+    }
+
+    /// Persist one forecast batch atomically: the projections made on
+    /// `made_on` targeting `for_day`.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn record_forecasts(
+        &self,
+        made_on: &str,
+        for_day: &str,
+        rows: &[ForecastInput<'_>],
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO forecasts
+                 (made_on, for_day, kind, key, projected, low, high, estimator)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .map_err(TrendError::from)?;
+        for r in rows {
+            stmt.execute(params![
+                made_on,
+                for_day,
+                r.kind.as_str(),
+                r.key,
+                r.projected,
+                r.low,
+                r.high,
+                r.estimator,
+            ])
+            .map_err(TrendError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Unscored forecasts whose target day has arrived (`for_day` <=
+    /// `today`), so the caller can score them against observations.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn due_forecasts(&self, today: &str) -> Result<Vec<DueForecast>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, for_day, kind, key, projected, low, high
+                 FROM forecasts
+                 WHERE actual IS NULL AND for_day <= ?1
+                 ORDER BY for_day, key",
+            )
+            .map_err(TrendError::from)?;
+        let rows = stmt
+            .query_map(params![today], |row| {
+                Ok(DueForecast {
+                    id: row.get(0)?,
+                    for_day: row.get(1)?,
+                    kind: SourceKind::parse(&row.get::<_, String>(2)?)
+                        .unwrap_or(SourceKind::GithubRepo),
+                    key: row.get(3)?,
+                    projected: row.get(4)?,
+                    low: row.get(5)?,
+                    high: row.get(6)?,
+                })
+            })
+            .map_err(TrendError::from)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(TrendError::from)
+    }
+
+    /// Write the observed next-day delta back onto one forecast row.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn score_forecast(&self, id: i64, actual: f64, band_hit: bool) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE forecasts SET actual = ?1, band_hit = ?2 WHERE id = ?3",
+            params![actual, i64::from(band_hit), id],
+        )
+        .map_err(TrendError::from)?;
+        Ok(())
+    }
+
+    /// All scored forecasts: (kind, projected, actual, band_hit), for
+    /// aggregate verification reporting.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn scored_forecasts(&self) -> Result<Vec<(SourceKind, f64, f64, bool)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, projected, actual, band_hit FROM forecasts
+                 WHERE actual IS NOT NULL",
+            )
+            .map_err(TrendError::from)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    SourceKind::parse(&row.get::<_, String>(0)?).unwrap_or(SourceKind::GithubRepo),
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            })
+            .map_err(TrendError::from)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(TrendError::from)
     }
 
     /// `(subject count, observation count)` for report headers.
@@ -758,6 +884,56 @@ mod tests {
         assert_eq!(ts, 3_000);
         assert!(!ok);
         assert_eq!(detail, "telegram 429: too many requests");
+    }
+
+    #[test]
+    fn forecasts_persist_score_and_aggregate() {
+        use crate::model::ForecastInput;
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.due_forecasts("2026-10-26").unwrap().is_empty());
+
+        let rows = vec![
+            ForecastInput {
+                kind: SourceKind::Crate,
+                key: "syn",
+                projected: 1_000.0,
+                low: 900.0,
+                high: 1_100.0,
+                estimator: "walk",
+            },
+            ForecastInput {
+                kind: SourceKind::HfModel,
+                key: "x/y",
+                projected: 50.0,
+                low: 10.0,
+                high: 90.0,
+                estimator: "mean",
+            },
+        ];
+        store
+            .record_forecasts("2026-10-25", "2026-10-26", &rows)
+            .unwrap();
+
+        // Due on the target morning itself: the 08:00 run has just
+        // collected the target day's observation.
+        let due = store.due_forecasts("2026-10-26").unwrap();
+        assert_eq!(due.len(), 2);
+        assert_eq!(due[0].key, "syn");
+
+        // Actual inside the band => hit; outside => miss.
+        store.score_forecast(due[0].id, 1_050.0, true).unwrap();
+        store.score_forecast(due[1].id, 500.0, false).unwrap();
+
+        let scored = store.scored_forecasts().unwrap();
+        assert_eq!(scored.len(), 2);
+        let syn = scored
+            .iter()
+            .find(|(k, ..)| *k == SourceKind::Crate)
+            .unwrap();
+        assert_eq!(syn.2, 1_050.0);
+        assert!(syn.3);
+        // Scored rows leave the due queue.
+        assert!(store.due_forecasts("2026-10-27").unwrap().is_empty());
     }
 
     #[test]
