@@ -422,8 +422,11 @@ impl Store {
     }
 
     /// Per-day count of GitHub subjects whose key ends with
-    /// `key_suffix` and whose fork ratio that day reached
-    /// `min_ratio_pct` — the growth curve of a name-cluster farm.
+    /// `key_suffix` and whose best-known fork ratio on or before that
+    /// day reached `min_ratio_pct` — the growth curve of a
+    /// name-cluster farm. Sources observe cluster members sporadically,
+    /// so each day counts every member whose last known state cleared
+    /// the line, not just members observed that same day.
     ///
     /// # Errors
     /// Propagates SQLite failures.
@@ -435,15 +438,27 @@ impl Store {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT date(o.ts, 'unixepoch') AS day,
-                        COUNT(DISTINCT s.key) AS orgs
-                 FROM observations o
-                 JOIN subjects s ON s.subject_id = o.subject_id
-                 WHERE s.kind = 'github_repo'
-                   AND s.key LIKE '%' || ?1
-                   AND o.score > 0
-                   AND o.extra1 * 100.0 / o.score >= ?2
-                 GROUP BY day ORDER BY day",
+                "WITH days AS (
+                   SELECT DISTINCT date(o.ts, 'unixepoch') AS day
+                   FROM observations o
+                   JOIN subjects s ON s.subject_id = o.subject_id
+                   WHERE s.kind = 'github_repo' AND s.key LIKE '%' || ?1
+                 ),
+                 ratios AS (
+                   SELECT s.key,
+                          date(o.ts, 'unixepoch') AS day,
+                          MAX(CASE WHEN o.score > 0
+                                   THEN o.extra1 * 100.0 / o.score
+                                   ELSE 0 END) AS max_ratio
+                   FROM observations o
+                   JOIN subjects s ON s.subject_id = o.subject_id
+                   WHERE s.kind = 'github_repo' AND s.key LIKE '%' || ?1
+                   GROUP BY s.key, day
+                 )
+                 SELECT d.day, COUNT(DISTINCT r.key) AS members
+                 FROM days d
+                 JOIN ratios r ON r.day <= d.day AND r.max_ratio >= ?2
+                 GROUP BY d.day ORDER BY d.day",
             )
             .map_err(TrendError::from)?;
         let rows = stmt
